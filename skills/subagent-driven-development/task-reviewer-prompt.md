@@ -37,9 +37,12 @@ Subagent (general-purpose):
 
     Read the diff file once — it contains the commit list, a stat summary,
     and the full diff with surrounding context, and it is your view of the
-    change. The diff's context lines ARE the changed files: do not Read a
-    changed file separately unless a hunk you must judge is cut off
-    mid-function — and say so in your report. Do not re-run git commands.
+    change. A file with a very long changed line is in a later section as
+    a word diff without the rest of that line; open the file when you need
+    more than the changed words, and say so. Otherwise the diff's context
+    lines ARE the changed files: do not Read a changed file separately
+    unless a hunk you must judge is cut off mid-function — and say so in
+    your report. Do not re-run git commands.
     If the diff file is missing, fetch the diff yourself:
     `git diff --stat [BASE_SHA]..[HEAD_SHA]` and `git diff [BASE_SHA]..[HEAD_SHA]`.
     Do not crawl the broader codebase. Inspect code outside the diff only

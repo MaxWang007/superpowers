@@ -827,6 +827,174 @@ PLAN
         echo "    now: $(cat "$own/.superpowers/sdd/.gitignore")"
     fi
 
+    # --- Long changed lines stay out of the -U10 diff (#2683) ---
+    # A one-word edit in a ~50KB JSON line or a 2KB Markdown paragraph used
+    # to copy the whole line into the package. Those files are a word diff;
+    # --stat and ordinary files stay as they were. Names with spaces and
+    # brackets, a rename, and a binary file sit in the same range.
+    local ll_repo ll_base ll_head ll_pkg ll_bytes ll_json_bytes ll_para
+    local ll_diff ll_word ll_stat ll_exp_stat ll_normal ll_note ll_short
+    local ll_full ll_rc ll_err ll_cs
+    ll_repo="$TEST_ROOT/long-lines"
+    git init -q -b main "$ll_repo"
+    git -C "$ll_repo" config core.autocrlf false
+    git -C "$ll_repo" config diff.renames true
+    mkdir -p "$ll_repo/docs" "$ll_repo/renamed"
+    awk 'BEGIN {
+        printf "%s", "{\"items\":["
+        for (i = 0; i < 7000; i++) {
+            if (i) printf ","
+            printf "\"w%04d\"", i
+        }
+        printf "]}\n"
+    }' > "$ll_repo/data.json"
+    awk 'BEGIN {
+        for (p = 1; p <= 4; p++) {
+            printf "Paragraph %d ", p
+            if (p == 2) printf "BEFOREWORD "
+            for (i = 0; i < 80; i++) printf "lorem ipsum dolor sit amet "
+            if (p == 2) printf "ENDMARKER2"
+            if (p == 4) printf "UNIQUEPARAGRAPH4"
+            printf "\n"
+        }
+    }' > "$ll_repo/docs/long note [draft].md"
+    awk 'BEGIN {
+        printf "%s", "{\"far\":\""
+        for (i = 0; i < 30; i++) printf "FARAWAYTOKEN "
+        printf "\",\"gap\":\""
+        for (i = 0; i < 80; i++) printf "xxxx"
+        printf "\",\"swap\":\"SWAPME\"}\n"
+    }' > "$ll_repo/old name.json"
+    printf 'keep-short-d\n' > "$ll_repo/docs/long note d.md"
+    awk 'BEGIN { for (i = 0; i < 25; i++) printf "line %d\n", i }' > "$ll_repo/normal.txt"
+    printf 'alpha\nbeta\n' > "$ll_repo/plain note.txt"
+    awk 'BEGIN { for (i = 0; i < 496; i++) printf "C"; printf "E500\n" }' > "$ll_repo/edge500.txt"
+    printf 'bin' > "$ll_repo/blob.bin"
+    printf '\0' >> "$ll_repo/blob.bin"
+    printf 'ary' >> "$ll_repo/blob.bin"
+    ( cd "$ll_repo" && git add -A && git "${git_id[@]}" commit -qm base )
+    awk '{ gsub(/w0042/, "wCHANGED"); print }' "$ll_repo/data.json" > "$ll_repo/data.json.new"
+    mv "$ll_repo/data.json.new" "$ll_repo/data.json"
+    awk '{ gsub(/BEFOREWORD/, "AFTERWORD"); print }' "$ll_repo/docs/long note [draft].md" > "$ll_repo/docs/note.new"
+    mv "$ll_repo/docs/note.new" "$ll_repo/docs/long note [draft].md"
+    printf 'changed-short-d\n' > "$ll_repo/docs/long note d.md"
+    awk '{ gsub(/line 10/, "line TEN"); print }' "$ll_repo/normal.txt" > "$ll_repo/normal.txt.new"
+    mv "$ll_repo/normal.txt.new" "$ll_repo/normal.txt"
+    awk '{ gsub(/beta/, "BETA"); print }' "$ll_repo/plain note.txt" > "$ll_repo/plain note.txt.new"
+    mv "$ll_repo/plain note.txt.new" "$ll_repo/plain note.txt"
+    awk '{ gsub(/E500/, "E50Y"); print }' "$ll_repo/edge500.txt" > "$ll_repo/edge500.txt.new"
+    mv "$ll_repo/edge500.txt.new" "$ll_repo/edge500.txt"
+    printf 'bin' > "$ll_repo/blob.bin"
+    printf '\0' >> "$ll_repo/blob.bin"
+    printf 'ARY' >> "$ll_repo/blob.bin"
+    ( cd "$ll_repo" && git mv "old name.json" "renamed/new name.json" )
+    awk '{ gsub(/SWAPME/, "SWAPPED"); print }' "$ll_repo/renamed/new name.json" > "$ll_repo/renamed/new name.json.new"
+    mv "$ll_repo/renamed/new name.json.new" "$ll_repo/renamed/new name.json"
+    ( cd "$ll_repo" && git add -A && git "${git_id[@]}" commit -qm change )
+    printf '# Plan\n\n## Task 1: Long lines\n\nTouch the long lines.\n' > "$ll_repo/plan.md"
+    ll_base="$(git -C "$ll_repo" rev-parse HEAD~1)"
+    ll_head="$(git -C "$ll_repo" rev-parse HEAD)"
+    ll_json_bytes="$(wc -c < "$ll_repo/data.json" | tr -d ' ')"
+    ll_para="$(awk 'NR == 2 { print length; exit }' "$ll_repo/docs/long note [draft].md")"
+    if [[ "$ll_json_bytes" -gt 50000 && "$(wc -l < "$ll_repo/data.json" | tr -d ' ')" -eq 1 \
+        && "$ll_para" -gt 2000 && "$ll_para" -lt 4000 ]]; then
+        pass "fixture is a 50KB one-line JSON file and a 2KB Markdown paragraph"
+    else
+        fail "fixture is a 50KB one-line JSON file and a 2KB Markdown paragraph"
+        echo "    json bytes: $ll_json_bytes"
+        echo "    paragraph:  $ll_para"
+    fi
+
+    ll_pkg="$TEST_ROOT/long-package.diff"
+    ( cd "$ll_repo" && "$SDD_SCRIPTS/review-package" plan.md "$ll_base" "$ll_head" "$ll_pkg" >/dev/null )
+    ll_bytes="$(wc -c < "$ll_pkg" | tr -d ' ')"
+    ll_diff="$(awk 'BEGIN { p = 0 } /^## Diff$/ { p = 1; next } /^## Files with long lines$/ { exit } p' "$ll_pkg")"
+    ll_word="$(awk '/^## Files with long lines$/ { p = 1 } p' "$ll_pkg")"
+    ll_stat="$(awk 'BEGIN { p = 0 } /^## Files changed$/ { p = 1; next } /^## Diff$/ { exit } p' "$ll_pkg")"
+    ll_exp_stat="$(git -C "$ll_repo" diff --stat "$ll_base" "$ll_head")"
+    if [[ "$ll_bytes" -lt 20000 && "$ll_bytes" -lt "$ll_json_bytes" ]]; then
+        pass "review package stays smaller than the long JSON line ($ll_bytes bytes)"
+    else
+        fail "review package stays smaller than the long JSON line ($ll_bytes bytes)"
+        echo "    json bytes: $ll_json_bytes"
+    fi
+    if [[ "$ll_word" == *"## Files with long lines"* \
+        && "$ll_word" == *"Open the file if you need more context."* \
+        && "$ll_word" == *"[-w0042-]{+wCHANGED+}"* \
+        && "$ll_word" == *"[-BEFOREWORD-]{+AFTERWORD+}"* \
+        && "$ll_word" == *"[-SWAPME-]{+SWAPPED+}"* \
+        && "$ll_word" == *"docs/long note [draft].md"* \
+        && "$ll_word" == *"rename from old name.json"* \
+        && "$ll_word" == *"rename to renamed/new name.json"* ]]; then
+        pass "long-line files are a word diff, including a spaced path and a rename"
+    else
+        fail "long-line files are a word diff, including a spaced path and a rename"
+        echo "    word section:"
+        printf '%s\n' "$ll_word" | head -n 40 | sed 's/^/      /'
+    fi
+    if ! grep -Fq 'w3000' "$ll_pkg" && ! grep -Fq 'ENDMARKER2' "$ll_pkg" \
+        && ! grep -Fq 'UNIQUEPARAGRAPH4' "$ll_pkg" && ! grep -Fq 'FARAWAYTOKEN' "$ll_pkg"; then
+        pass "unchanged text from the long lines is not copied into the package"
+    else
+        fail "unchanged text from the long lines is not copied into the package"
+    fi
+    if [[ "$ll_stat" == "$ll_exp_stat" ]]; then
+        pass "review-package --stat still lists every file in the range"
+    else
+        fail "review-package --stat still lists every file in the range"
+        echo "    got:"
+        printf '%s\n' "$ll_stat" | sed 's/^/      /'
+        echo "    expected:"
+        printf '%s\n' "$ll_exp_stat" | sed 's/^/      /'
+    fi
+    ll_normal="$(git -C "$ll_repo" diff -U10 "$ll_base" "$ll_head" -- ":(literal)normal.txt")"
+    ll_note="$(git -C "$ll_repo" diff -U10 "$ll_base" "$ll_head" -- ":(literal)plain note.txt")"
+    ll_short="$(git -C "$ll_repo" diff -U10 "$ll_base" "$ll_head" -- ":(literal)docs/long note d.md")"
+    ll_cs="$(awk 'BEGIN { for (i = 0; i < 80; i++) printf "C" }')"
+    if [[ "$ll_diff" == *"$ll_normal"* && "$ll_diff" == *"$ll_note"* && "$ll_diff" == *"$ll_short"* \
+        && "$ll_diff" == *"Binary files a/blob.bin and b/blob.bin differ"* \
+        && "$ll_diff" == *"$ll_cs"* && "$ll_diff" == *"E500"* && "$ll_diff" == *"E50Y"* \
+        && "$ll_diff" != *"a/data.json "* \
+        && "$ll_diff" != *"long note [draft].md"* \
+        && "$ll_diff" != *"new name.json"* \
+        && "$ll_word" != *"blob.bin"* && "$ll_word" != *"E500"* ]]; then
+        pass "ordinary files, the binary, and a 500-character line keep the -U10 diff"
+    else
+        fail "ordinary files, the binary, and a 500-character line keep the -U10 diff"
+        echo "    diff files:"
+        printf '%s\n' "$ll_diff" | grep '^diff --git' | sed 's/^/      /' || true
+    fi
+
+    ll_full="$TEST_ROOT/long-package-full.diff"
+    ( cd "$ll_repo" && REVIEW_PACKAGE_LONG_LINE=1000000 "$SDD_SCRIPTS/review-package" plan.md "$ll_base" "$ll_head" "$ll_full" >/dev/null )
+    {
+        echo "# Review package: ${ll_base}..${ll_head}"
+        echo
+        echo "## Commits"
+        git -C "$ll_repo" log --oneline "${ll_base}..${ll_head}"
+        echo
+        echo "## Files changed"
+        git -C "$ll_repo" diff --stat "${ll_base}..${ll_head}"
+        echo
+        echo "## Diff"
+        git -C "$ll_repo" diff -U10 "${ll_base}..${ll_head}"
+    } > "$TEST_ROOT/long-package-expected.diff"
+    if cmp -s "$ll_full" "$TEST_ROOT/long-package-expected.diff"; then
+        pass "raising REVIEW_PACKAGE_LONG_LINE leaves the package identical to -U10"
+    else
+        fail "raising REVIEW_PACKAGE_LONG_LINE leaves the package identical to -U10"
+    fi
+
+    ll_rc=0
+    ll_err="$(cd "$ll_repo" && REVIEW_PACKAGE_LONG_LINE=nope "$SDD_SCRIPTS/review-package" plan.md "$ll_base" "$ll_head" "$TEST_ROOT/bad-long.diff" 2>&1 >/dev/null)" || ll_rc=$?
+    if [[ "$ll_rc" -eq 2 && "$ll_err" == *"bad REVIEW_PACKAGE_LONG_LINE"* ]]; then
+        pass "a non-numeric REVIEW_PACKAGE_LONG_LINE errors with exit 2"
+    else
+        fail "a non-numeric REVIEW_PACKAGE_LONG_LINE errors with exit 2"
+        echo "    exit: $ll_rc"
+        echo "    stderr: $ll_err"
+    fi
+
     echo ""
     if [[ "$FAILURES" -ne 0 ]]; then
         echo "FAILED: $FAILURES assertion(s)."

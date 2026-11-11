@@ -35,7 +35,9 @@ Subagent (general-purpose):
     **Diff file:** [DIFF_FILE]
 
     Read the diff file once — it contains the fix commits, a stat summary,
-    and the fix diff with surrounding context. Do not re-run git commands.
+    and the fix diff with surrounding context. A file with a very long
+    changed line is in a later section as a word diff; open the file when
+    you need more than the changed words. Do not re-run git commands.
     If the diff file is missing, fetch the diff yourself:
     `git diff --stat [FIX_BASE_SHA]..[HEAD_SHA]` and
     `git diff [FIX_BASE_SHA]..[HEAD_SHA]`.

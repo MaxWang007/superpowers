@@ -4,6 +4,13 @@
 # call. Using the recorded per-task BASE (not HEAD~1) keeps multi-commit
 # tasks intact.
 #
+# A changed line longer than REVIEW_PACKAGE_LONG_LINE characters (default
+# 500) is left out of the -U10 diff and appended as a word diff. Plain
+# word diff still reprints the rest of the line, which is the bloat, so
+# that section keeps the changed words and a short run of neighbors.
+# One-line JSON and one-paragraph-per-line Markdown otherwise copy tens
+# of KB of unchanged text into every review round (#2683).
+#
 # Usage: review-package [-C DIR] PLAN_FILE BASE HEAD [OUTFILE]
 # Default OUTFILE: <repo-root>/.superpowers/sdd/<plan-basename>/review-<base7>..<head7>.diff
 # (named per range, so a re-review after fixes gets a distinct fresh file).
@@ -22,6 +29,20 @@ if [ $# -lt 3 ] || [ $# -gt 4 ]; then
   echo "usage: review-package [-C DIR] PLAN_FILE BASE HEAD [OUTFILE]" >&2
   exit 2
 fi
+
+# Characters, counted the way bash counts ${#...}. Override when a repo's
+# normal lines run long, or set it high to keep today's -U10 output.
+long_line_limit=${REVIEW_PACKAGE_LONG_LINE:-500}
+case "$long_line_limit" in
+  ''|*[!0-9]*)
+    echo "bad REVIEW_PACKAGE_LONG_LINE: ${long_line_limit}" >&2
+    exit 2
+    ;;
+esac
+long_line_limit=$((10#$long_line_limit))
+# Unchanged text kept on either side of a changed word. The rest of a
+# long line is what made the package huge; the reviewer can open the file.
+word_ctx=40
 
 plan=$1
 base=$2
@@ -47,6 +68,294 @@ else
   out="$dir/review-$(git -C "$repo" rev-parse --short "$base")..$(git -C "$repo" rev-parse --short "$head").diff"
 fi
 
+# Porcelain word diff, printed with the same [-old-]{+new+} markers as
+# --word-diff=plain. Alnum tokens keep prose as words; every other
+# non-space character is its own token so a minified JSON line is not one word.
+word_regex='[[:alnum:]_]+|[^[:space:]]'
+wd_kinds=()
+wd_texts=()
+wd_line=""
+
+# True when any added or removed line in this path list is over the limit.
+# Called from `if`, where set -e is suppressed, so a failing git must exit
+# itself. Rename pairs need both paths: one side alone is a full add or
+# delete, and every line looks changed.
+paths_have_long_changed_line() {
+  local line content in_hunk found tmp status spec
+  local -a specs
+  specs=()
+  tmp=$(mktemp)
+  found=0
+  in_hunk=0
+  for spec in "$@"; do
+    specs+=(":(literal)${spec}")
+  done
+  status=0
+  git -C "$repo" diff --no-color -U0 "${base}..${head}" -- "${specs[@]}" >"$tmp" || status=$?
+  if [ "$status" -ne 0 ]; then
+    rm -f "$tmp"
+    exit "$status"
+  fi
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      @@*)
+        in_hunk=1
+        ;;
+      diff\ --git\ *)
+        in_hunk=0
+        ;;
+      [+-]*)
+        if [ "$in_hunk" -eq 1 ]; then
+          content=${line#?}
+          if [ "${#content}" -gt "$long_line_limit" ]; then
+            found=1
+            break
+          fi
+        fi
+        ;;
+    esac
+  done <"$tmp"
+  rm -f "$tmp"
+  [ "$found" -eq 1 ]
+}
+
+append_trimmed_context() {
+  local text=$1 prev_change=$2 next_change=$3 len=${#1}
+  if [ "$prev_change" -eq 1 ] && [ "$next_change" -eq 1 ]; then
+    if [ "$len" -gt $((word_ctx * 2)) ]; then
+      wd_line="${wd_line}${text:0:word_ctx} ... ${text:$((len - word_ctx))}"
+    else
+      wd_line="${wd_line}${text}"
+    fi
+  elif [ "$next_change" -eq 1 ]; then
+    if [ "$len" -gt "$word_ctx" ]; then
+      wd_line="${wd_line}...${text:$((len - word_ctx))}"
+    else
+      wd_line="${wd_line}${text}"
+    fi
+  elif [ "$prev_change" -eq 1 ]; then
+    if [ "$len" -gt "$word_ctx" ]; then
+      wd_line="${wd_line}${text:0:word_ctx}..."
+    else
+      wd_line="${wd_line}${text}"
+    fi
+  elif [ "$len" -gt $((word_ctx * 2)) ]; then
+    wd_line="${wd_line}${text:0:word_ctx} ... ${text:$((len - word_ctx))}"
+  else
+    wd_line="${wd_line}${text}"
+  fi
+}
+
+# A replaced token longer than the limit (one JSON string, one word
+# changed inside it) is shown around the first differing character. Anything
+# shorter is the changed word itself and is kept whole.
+append_replacement() {
+  local old=$1 new=$2 olen=${#1} nlen=${#2}
+  local i max hi mid from old_win new_win lead tail old_shown new_shown
+  if [ "$olen" -le "$long_line_limit" ] && [ "$nlen" -le "$long_line_limit" ]; then
+    wd_line="${wd_line}[-${old}-]{+${new}+}"
+    return
+  fi
+  max=$olen
+  if [ "$nlen" -lt "$max" ]; then
+    max=$nlen
+  fi
+  # Binary search: walking the token a character at a time in bash takes
+  # the better part of a minute on a 50KB line.
+  i=0
+  hi=$max
+  while [ "$i" -lt "$hi" ]; do
+    mid=$(((i + hi + 1) / 2))
+    if [ "${old:0:mid}" = "${new:0:mid}" ]; then
+      i=$mid
+    else
+      hi=$((mid - 1))
+    fi
+  done
+  from=$((i - word_ctx))
+  if [ "$from" -lt 0 ]; then
+    from=0
+  fi
+  old_win=${old:$from:$((word_ctx * 2))}
+  new_win=${new:$from:$((word_ctx * 2))}
+  lead=""
+  tail=""
+  if [ "$from" -gt 0 ]; then
+    lead="..."
+  fi
+  old_shown=$((from + ${#old_win}))
+  new_shown=$((from + ${#new_win}))
+  if [ "$old_shown" -lt "$olen" ] || [ "$new_shown" -lt "$nlen" ]; then
+    tail="..."
+  fi
+  wd_line="${wd_line}${lead}[-${old_win}-]{+${new_win}+}${tail}"
+}
+
+shorten_piece() {
+  local text=$1 len=${#1}
+  if [ "$len" -le "$long_line_limit" ] || [ "$len" -le $((word_ctx * 2)) ]; then
+    printf '%s' "$text"
+    return
+  fi
+  printf '%s...%s' "${text:0:word_ctx}" "${text:$((len - word_ctx))}"
+}
+
+append_change_run() {
+  local start=$1 end=$2 kind piece
+  if [ $((end - start)) -eq 2 ] \
+    && [ "${wd_kinds[$start]}" = "del" ] \
+    && [ "${wd_kinds[$((start + 1))]}" = "add" ]; then
+    append_replacement "${wd_texts[$start]}" "${wd_texts[$((start + 1))]}"
+    return
+  fi
+  while [ "$start" -lt "$end" ]; do
+    kind=${wd_kinds[$start]}
+    piece=$(shorten_piece "${wd_texts[$start]}")
+    if [ "$kind" = "del" ]; then
+      wd_line="${wd_line}[-${piece}-]"
+    else
+      wd_line="${wd_line}{+${piece}+}"
+    fi
+    start=$((start + 1))
+  done
+}
+
+render_word_line() {
+  local i n text start run_end prev_change next_change
+  n=${#wd_kinds[@]}
+  wd_line=""
+  prev_change=0
+  i=0
+  while [ "$i" -lt "$n" ]; do
+    if [ "${wd_kinds[$i]}" = "ctx" ]; then
+      text=""
+      while [ "$i" -lt "$n" ] && [ "${wd_kinds[$i]}" = "ctx" ]; do
+        text="${text}${wd_texts[$i]}"
+        i=$((i + 1))
+      done
+      next_change=0
+      if [ "$i" -lt "$n" ]; then
+        next_change=1
+      fi
+      append_trimmed_context "$text" "$prev_change" "$next_change"
+    else
+      run_end=$i
+      while [ "$run_end" -lt "$n" ] && [ "${wd_kinds[$run_end]}" != "ctx" ]; do
+        run_end=$((run_end + 1))
+      done
+      append_change_run "$i" "$run_end"
+      prev_change=1
+      i=$run_end
+    fi
+  done
+  printf '%s\n' "$wd_line"
+}
+
+flush_word_line() {
+  [ "${#wd_kinds[@]}" -eq 0 ] && return 0
+  render_word_line
+  wd_kinds=()
+  wd_texts=()
+}
+
+# stdin is one --word-diff=porcelain -U0 diff.
+compact_porcelain() {
+  local line in_hunk=0
+  wd_kinds=()
+  wd_texts=()
+  while IFS= read -r line || [ -n "$line" ]; do
+    if [ "$in_hunk" -eq 0 ]; then
+      printf '%s\n' "$line"
+      case "$line" in
+        @@*) in_hunk=1 ;;
+      esac
+      continue
+    fi
+    case "$line" in
+      '~')
+        # Quoted: an unquoted ~ in a case pattern is tilde-expanded.
+        flush_word_line
+        ;;
+      " "*)
+        wd_kinds+=("ctx")
+        wd_texts+=("${line# }")
+        ;;
+      -*)
+        wd_kinds+=("del")
+        wd_texts+=("${line#-}")
+        ;;
+      +*)
+        wd_kinds+=("add")
+        wd_texts+=("${line#+}")
+        ;;
+      @@*)
+        flush_word_line
+        printf '%s\n' "$line"
+        ;;
+      diff\ --git\ *)
+        flush_word_line
+        in_hunk=0
+        printf '%s\n' "$line"
+        ;;
+      \\*)
+        printf '%s\n' "$line"
+        ;;
+      *)
+        flush_word_line
+        in_hunk=0
+        printf '%s\n' "$line"
+        ;;
+    esac
+  done
+  flush_word_line
+}
+
+write_word_diffs() {
+  local i tmp
+  tmp=$(mktemp)
+  i=0
+  while [ "$i" -lt "${#long_right[@]}" ]; do
+    if [ -n "${long_left[$i]}" ]; then
+      git -C "$repo" diff --no-color --word-diff=porcelain --word-diff-regex="$word_regex" -U0 \
+        "${base}..${head}" -- ":(literal)${long_left[$i]}" ":(literal)${long_right[$i]}" >"$tmp"
+    else
+      git -C "$repo" diff --no-color --word-diff=porcelain --word-diff-regex="$word_regex" -U0 \
+        "${base}..${head}" -- ":(literal)${long_right[$i]}" >"$tmp"
+    fi
+    compact_porcelain <"$tmp"
+    i=$((i + 1))
+  done
+  rm -f "$tmp"
+}
+
+# Left is the pre-image of a rename or copy; empty for every other change.
+# Both sides are excluded: excluding only the pre-image leaves the
+# post-image in the -U10 diff.
+long_left=()
+long_right=()
+names=$(mktemp)
+git -C "$repo" diff --name-status -z "${base}..${head}" >"$names"
+while IFS= read -r -d '' status; do
+  case "$status" in
+    R*|C*)
+      IFS= read -r -d '' old_path || exit 1
+      IFS= read -r -d '' new_path || exit 1
+      if paths_have_long_changed_line "$old_path" "$new_path"; then
+        long_left+=("$old_path")
+        long_right+=("$new_path")
+      fi
+      ;;
+    *)
+      IFS= read -r -d '' one_path || exit 1
+      if paths_have_long_changed_line "$one_path"; then
+        long_left+=("")
+        long_right+=("$one_path")
+      fi
+      ;;
+  esac
+done <"$names"
+rm -f "$names"
+
 {
   echo "# Review package: ${base}..${head}"
   echo
@@ -57,8 +366,29 @@ fi
   git -C "$repo" diff --stat "${base}..${head}"
   echo
   echo "## Diff"
-  git -C "$repo" diff -U10 "${base}..${head}"
-} > "$out"
+  if [ "${#long_right[@]}" -eq 0 ]; then
+    git -C "$repo" diff -U10 "${base}..${head}"
+  else
+    exclude_args=()
+    i=0
+    while [ "$i" -lt "${#long_right[@]}" ]; do
+      if [ -n "${long_left[$i]}" ]; then
+        exclude_args+=(":(literal,exclude)${long_left[$i]}")
+      fi
+      exclude_args+=(":(literal,exclude)${long_right[$i]}")
+      i=$((i + 1))
+    done
+    # The leading "." is the positive pathspec exclude matches against.
+    # literal so a name like "file[1].md" is not a glob.
+    git -C "$repo" diff -U10 "${base}..${head}" -- . "${exclude_args[@]}"
+    echo
+    echo "## Files with long lines"
+    echo
+    echo "Changed lines in these files are longer than ${long_line_limit} characters and are shown as a word diff without the rest of the line. Open the file if you need more context."
+    echo
+    write_word_diffs
+  fi
+} >"$out"
 
 commits=$(git -C "$repo" rev-list --count "${base}..${head}")
-echo "wrote ${out}: ${commits} commit(s), $(wc -c < "$out" | tr -d ' ') bytes"
+echo "wrote ${out}: ${commits} commit(s), $(wc -c <"$out" | tr -d ' ') bytes"
